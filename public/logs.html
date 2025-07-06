@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>日志系统 - 请求日志</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <header class="header">
+    <h1>OpenAI API 代理日志系统</h1>
+    <div class="user-info">
+      <span id="username-display"></span>
+      <button id="logout-btn" class="btn btn-danger">退出登录</button>
+    </div>
+  </header>
+  
+  <div class="container">
+    <div class="logs-container">
+      <div class="filters">
+        <div class="filter-group">
+          <label for="search-input">搜索:</label>
+          <input type="text" id="search-input" placeholder="搜索请求路径或请求体">
+        </div>
+        <div class="filter-group">
+          <label for="status-filter">状态码:</label>
+          <select id="status-filter">
+            <option value="">全部</option>
+            <option value="200">200 - 成功</option>
+            <option value="400">400 - 错误请求</option>
+            <option value="401">401 - 未授权</option>
+            <option value="404">404 - 未找到</option>
+            <option value="500">500 - 服务器错误</option>
+          </select>
+        </div>
+        <div class="filter-group">
+          <label for="ip-filter">客户端IP:</label>
+          <select id="ip-filter">
+            <option value="">全部</option>
+          </select>
+        </div>
+      </div>
+      
+      <table id="logs-table" class="logs-table">
+        <tr>
+          <th>请求ID</th>
+          <th>客户端IP</th>
+          <th>请求路径</th>
+          <th>状态</th>
+          <th>响应时间</th>
+          <th>时间</th>
+        </tr>
+        <tr>
+          <td colspan="6" style="text-align: center;">加载中...</td>
+        </tr>
+      </table>
+      
+      <div id="pagination" class="pagination"></div>
+    </div>
+  </div>
+  
+  <!-- 日志详情模态框 -->
+  <div id="log-modal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 class="modal-title">请求详情</h3>
+        <span class="close-modal">&times;</span>
+      </div>
+      <div class="modal-body">
+        <!-- 详情内容将在JavaScript中动态添加 -->
+      </div>
+    </div>
+  </div>
+  
+  <script src="/js/auth.js"></script>
+  <script src="/js/logs.js"></script>
+</body>
+</html> 
