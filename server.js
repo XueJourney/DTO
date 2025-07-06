@@ -13,18 +13,18 @@ const PORT = process.env.PORT || 3000;
 
 // 认证配置
 const AUTH_CONFIG = {
-  username: 'DuHeng',
-  password: 'LeoXue_6464496', // 生产环境中应使用哈希存储
+  username: '此处改为你的用户名',
+  password: '此处改为你的密码', // 生产环境中应使用哈希存储
   secret: crypto.randomBytes(64).toString('hex') // 随机生成会话密钥
 };
 
 // 数据库配置
 const DB_CONFIG = {
-  host: '43.135.16.234',
+  host: '此处改为你的mySQL的host',
   port: 3306,
-  user: 'DTO',
-  password: 'GFwP43HXiJaHzfPk',
-  database: 'DTO',
+  user: '此处改为你的mySQL的user',
+  password: '此处改为你的mySQL的password',
+  database: '此处改为你的mySQL的数据库',
   charset: 'utf8mb4',
   timezone: '+08:00'
 };
