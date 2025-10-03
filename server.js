@@ -7,26 +7,131 @@ const fs = require('fs');
 const session = require('express-session');
 const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
+const { TextDecoder } = require('util');
+
+function loadEnvFile() {
+  const envPath = path.join(__dirname, '.env');
+  if (!fs.existsSync(envPath)) {
+    return;
+  }
+
+  try {
+    const content = fs.readFileSync(envPath, 'utf8');
+    content.split(/\r?\n/).forEach((line) => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) {
+        return;
+      }
+
+      const delimiterIndex = trimmed.indexOf('=');
+      if (delimiterIndex === -1) {
+        return;
+      }
+
+      const key = trimmed.slice(0, delimiterIndex).trim();
+      const value = trimmed.slice(delimiterIndex + 1).trim();
+
+      if (key && process.env[key] === undefined) {
+        process.env[key] = value;
+      }
+    });
+  } catch (error) {
+    console.error('读取 .env 文件失败:', error);
+  }
+}
+
+loadEnvFile();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+
+function numberFromEnv(envKey, fallback) {
+  const value = process.env[envKey];
+  if (value === undefined) {
+    return fallback;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function logSecurityWarning(message) {
+  console.warn(`\u26a0\ufe0f  ${message}`);
+}
+
+function safeCompare(a, b) {
+  const hashA = crypto.createHash('sha256').update(String(a ?? '')).digest();
+  const hashB = crypto.createHash('sha256').update(String(b ?? '')).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
+
+function resolveSessionSecret() {
+  if (process.env.SESSION_SECRET) {
+    return process.env.SESSION_SECRET;
+  }
+
+  logSecurityWarning('SESSION_SECRET 未配置，将使用临时密钥。请在生产环境中设置 SESSION_SECRET 环境变量，以避免会话在重启后失效。');
+  return crypto.randomBytes(64).toString('hex');
+}
+
+function verifyPassword(inputPassword) {
+  if (!inputPassword) {
+    return false;
+  }
+
+  if (AUTH_CONFIG.passwordHash && AUTH_CONFIG.passwordSalt) {
+    try {
+      const derived = crypto.scryptSync(inputPassword, AUTH_CONFIG.passwordSalt, 64);
+      const expected = Buffer.from(AUTH_CONFIG.passwordHash, 'hex');
+
+      if (expected.length !== derived.length) {
+        return false;
+      }
+
+      return crypto.timingSafeEqual(derived, expected);
+    } catch (error) {
+      console.error('验证密码哈希失败:', error);
+      return false;
+    }
+  }
+
+  return safeCompare(inputPassword, AUTH_CONFIG.password);
+}
+
+function verifyCredentials(username, password) {
+  if (!username || !password) {
+    return false;
+  }
+
+  return safeCompare(username, AUTH_CONFIG.username) && verifyPassword(password);
+}
 
 // 认证配置
 const AUTH_CONFIG = {
-  username: '此处改为你的用户名',
-  password: '此处改为你的密码', // 生产环境中应使用哈希存储
-  secret: crypto.randomBytes(64).toString('hex') // 随机生成会话密钥
+  username: process.env.AUTH_USERNAME || 'admin',
+  password: process.env.AUTH_PASSWORD || 'change-me',
+  passwordHash: process.env.AUTH_PASSWORD_HASH || null,
+  passwordSalt: process.env.AUTH_PASSWORD_SALT || null,
+  secret: resolveSessionSecret()
 };
+
+if (!process.env.AUTH_PASSWORD_HASH) {
+  logSecurityWarning('未检测到 AUTH_PASSWORD_HASH，当前将使用明文密码进行比对。请使用 scripts/hash-password.js 生成哈希并配置 AUTH_PASSWORD_HASH/ AUTH_PASSWORD_SALT。');
+}
+
+if (AUTH_CONFIG.username === 'admin' && AUTH_CONFIG.password === 'change-me' && !AUTH_CONFIG.passwordHash) {
+  logSecurityWarning('当前仍在使用默认的后台账号密码 admin/change-me，请尽快修改为强密码或配置 AUTH_PASSWORD_HASH。');
+}
 
 // 数据库配置
 const DB_CONFIG = {
-  host: '此处改为你的mySQL的host',
-  port: 3306,
-  user: '此处改为你的mySQL的user',
-  password: '此处改为你的mySQL的password',
-  database: '此处改为你的mySQL的数据库',
-  charset: 'utf8mb4',
-  timezone: '+08:00'
+  host: process.env.DB_HOST || 'localhost',
+  port: numberFromEnv('DB_PORT', 3306),
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'dto_proxy',
+  charset: process.env.DB_CHARSET || 'utf8mb4',
+  timezone: process.env.DB_TIMEZONE || '+08:00'
 };
 
 // 创建数据库连接池
@@ -84,6 +189,24 @@ async function executeQuery(sql, params = []) {
   }
 }
 
+// 缓存 request_logs 表是否包含 client_ip 列的结果，避免每次请求都查询元数据
+let clientIpColumnStatusPromise = null;
+
+async function hasClientIpColumn() {
+  if (!clientIpColumnStatusPromise) {
+    clientIpColumnStatusPromise = executeQuery(
+      `SHOW COLUMNS FROM request_logs LIKE 'client_ip'`
+    )
+      .then(([columnsResult]) => columnsResult.length > 0)
+      .catch(error => {
+        clientIpColumnStatusPromise = null;
+        throw error;
+      });
+  }
+
+  return clientIpColumnStatusPromise;
+}
+
 // 中间件
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -94,7 +217,7 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   cookie: { 
-    secure: process.env.NODE_ENV === 'production', // 在生产环境中使用HTTPS
+    secure: NODE_ENV === 'production', // 在生产环境中使用HTTPS
     httpOnly: true,
     maxAge: 24 * 60 * 60 * 1000 // 24小时
   }
@@ -121,13 +244,22 @@ function authMiddleware(req, res, next) {
 
 // 配置信息
 const CONFIG = {
-  API_URL: 'https://www.gpt4novel.com/api/xiaoshuoai/ext/v1/chat/completions',
-  DEFAULT_MODEL: 'nalang-xl-10',
-  DEFAULT_TEMPERATURE: 0.7,
-  DEFAULT_MAX_TOKENS: 800,
-  DEFAULT_TOP_P: 0.35,
-  DEFAULT_REPETITION_PENALTY: 1.05
+  API_URL: process.env.UPSTREAM_API_URL || 'https://www.gpt4novel.com/api/xiaoshuoai/ext/v1/chat/completions',
+  DEFAULT_MODEL: process.env.UPSTREAM_DEFAULT_MODEL || 'nalang-xl-10',
+  DEFAULT_TEMPERATURE: numberFromEnv('DEFAULT_TEMPERATURE', 0.7),
+  DEFAULT_MAX_TOKENS: numberFromEnv('DEFAULT_MAX_TOKENS', 800),
+  DEFAULT_TOP_P: numberFromEnv('DEFAULT_TOP_P', 0.35),
+  DEFAULT_REPETITION_PENALTY: numberFromEnv('DEFAULT_REPETITION_PENALTY', 1.05)
 };
+
+let dynamicModelMapping = {};
+if (process.env.MODEL_MAPPING_JSON) {
+  try {
+    dynamicModelMapping = JSON.parse(process.env.MODEL_MAPPING_JSON);
+  } catch (error) {
+    console.error('解析 MODEL_MAPPING_JSON 失败，将使用内置映射。', error);
+  }
+}
 
 // 模型映射
 const MODEL_MAPPING = {
@@ -137,10 +269,11 @@ const MODEL_MAPPING = {
   'gpt-4-32k': 'nalang-xl-16k',
   'gpt-4-turbo': 'nalang-v17-2',
   'gpt-4-turbo-preview': 'nalang-v17-2',
-  'nalang-turbo-v19':'nalang-turbo-v19',
-  'nalang-xl-16k':'nalang-xl-16k',
-  'nalang-xl-10':'nalang-xl-10',
-  'nalang-v17-2':'nalang-v17-2'
+  'nalang-turbo-v19': 'nalang-turbo-v19',
+  'nalang-xl-16k': 'nalang-xl-16k',
+  'nalang-xl-10': 'nalang-xl-10',
+  'nalang-v17-2': 'nalang-v17-2',
+  ...dynamicModelMapping
 };
 
 // 初始化数据库
@@ -199,20 +332,21 @@ async function initializeDatabase() {
 async function migrateDatabase() {
   try {
     // 检查request_logs表是否存在client_ip列
-    const [columnsResult] = await executeQuery(`
-      SHOW COLUMNS FROM request_logs LIKE 'client_ip'
-    `);
-    
+    const hasClientIp = await hasClientIpColumn();
+
     // 如果不存在client_ip列，添加它
-    if (columnsResult.length === 0) {
+    if (!hasClientIp) {
       await executeQuery(`
-        ALTER TABLE request_logs 
+        ALTER TABLE request_logs
         ADD COLUMN client_ip VARCHAR(45) NOT NULL DEFAULT '127.0.0.1' AFTER request_id,
         ADD INDEX idx_client_ip (client_ip)
       `);
       console.log('✅ Added client_ip column to request_logs table');
+
+      // 列添加成功后，更新缓存状态
+      clientIpColumnStatusPromise = Promise.resolve(true);
     }
-    
+
     console.log('✅ Database migration completed successfully');
   } catch (error) {
     console.error('❌ Database migration failed:', error);
@@ -238,17 +372,11 @@ function getClientIp(req) {
 // 记录请求日志
 async function logRequest(logData) {
   try {
-    // 检查request_logs表是否存在client_ip列
-    const [columnsResult] = await executeQuery(`
-      SHOW COLUMNS FROM request_logs LIKE 'client_ip'
-    `);
-    
-    const columns = columnsResult;
-    
     // 根据列是否存在构建不同的SQL语句
+    const hasClientIp = await hasClientIpColumn();
     let sql, params;
-    
-    if (columns.length > 0) {
+
+    if (hasClientIp) {
       // 如果存在client_ip列
       sql = `
         INSERT INTO request_logs (
@@ -277,8 +405,8 @@ async function logRequest(logData) {
         INSERT INTO request_logs (
           request_id, user_agent, request_method, request_path,
           request_headers, request_body, response_status, response_headers,
-          response_body, response_time, error_message
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        response_body, response_time, error_message
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `;
       params = [
         logData.request_id,
@@ -302,23 +430,19 @@ async function logRequest(logData) {
 }
 
 // 更新统计数据
-async function updateStatistics(isSuccess, responseTime, tokenCount = 0, clientIp) {
+async function updateStatistics(isSuccess, responseTime, tokenCount = 0) {
   try {
     const today = new Date().toISOString().split('T')[0];
-    
+
     // 首先检查client_ip列是否存在
-    const [columnsResult] = await executeQuery(`
-      SHOW COLUMNS FROM request_logs LIKE 'client_ip'
-    `);
-    
-    const columns = columnsResult;
-    
+    const hasClientIp = await hasClientIpColumn();
+
     // 根据client_ip列是否存在构建唯一IP查询
     let uniqueIpsQuery = '1'; // 默认值，以防列不存在
-    if (columns.length > 0) {
+    if (hasClientIp) {
       uniqueIpsQuery = `(
-        SELECT COUNT(DISTINCT client_ip) 
-        FROM request_logs 
+        SELECT COUNT(DISTINCT client_ip)
+        FROM request_logs
         WHERE DATE(created_at) = ?
       )`;
     }
@@ -347,9 +471,9 @@ async function updateStatistics(isSuccess, responseTime, tokenCount = 0, clientI
       isSuccess ? 0 : 1,
       responseTime,
       tokenCount,
-      ...(columns.length > 0 ? [today] : [])
+      ...(hasClientIp ? [today] : [])
     ];
-    
+
     await executeQuery(sql, params);
   } catch (error) {
     console.error('Failed to update statistics:', error);
@@ -437,7 +561,7 @@ function loggingMiddleware(req, res, next) {
     // 更新统计
     const isSuccess = res.statusCode >= 200 && res.statusCode < 400;
     const tokenCount = estimateTokenCount(responseBody);
-    await updateStatistics(isSuccess, responseTime, tokenCount, req.clientIp);
+    await updateStatistics(isSuccess, responseTime, tokenCount);
     
     // 控制台日志
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} - ${res.statusCode} - ${responseTime}ms - ${req.clientIp}`);
@@ -495,53 +619,6 @@ function parseStreamLine(line) {
   }
 }
 
-// 处理流式响应并收集完整内容
-function collectStreamContent(response) {
-  return new Promise((resolve, reject) => {
-    let fullContent = '';
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    response.body.on('data', (chunk) => {
-      buffer += decoder.decode(chunk, { stream: true });
-      
-      let newlineIndex;
-      while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
-        const line = buffer.slice(0, newlineIndex);
-        buffer = buffer.slice(newlineIndex + 1);
-        
-        const parsed = parseStreamLine(line);
-        if (parsed) {
-          if (parsed.done) {
-            resolve(fullContent);
-            return;
-          }
-          
-          if (parsed.choices?.[0]?.delta?.content) {
-            fullContent += parsed.choices[0].delta.content;
-          } else if (parsed.choices?.[0]?.message?.content) {
-            fullContent += parsed.choices[0].message.content;
-          }
-        }
-      }
-    });
-
-    response.body.on('end', () => {
-      if (buffer.trim()) {
-        const parsed = parseStreamLine(buffer.trim());
-        if (parsed && parsed.choices?.[0]?.delta?.content) {
-          fullContent += parsed.choices[0].delta.content;
-        }
-      }
-      resolve(fullContent);
-    });
-
-    response.body.on('error', (error) => {
-      reject(error);
-    });
-  });
-}
-
 // 处理聊天完成请求的核心函数
 async function handleChatCompletion(req, res) {
   try {
@@ -587,15 +664,39 @@ async function handleChatCompletion(req, res) {
 
     const mappedModel = MODEL_MAPPING[model] || model;
 
+    const shouldStream = typeof stream === 'string'
+      ? stream === 'true'
+      : Boolean(stream);
+
     const requestBody = {
       model: mappedModel,
       messages: messages,
-      stream: true,
+      stream: shouldStream,
       temperature: temperature,
       max_tokens: max_tokens,
       top_p: top_p,
       repetition_penalty: repetition_penalty
     };
+
+    const optionalParams = {
+      frequency_penalty,
+      presence_penalty,
+      stop,
+      n,
+      logit_bias,
+      user,
+      response_format,
+      seed,
+      tools,
+      tool_choice,
+      ...otherParams
+    };
+
+    for (const [key, value] of Object.entries(optionalParams)) {
+      if (value !== undefined) {
+        requestBody[key] = value;
+      }
+    }
 
     const response = await fetch(CONFIG.API_URL, {
       method: 'POST',
@@ -617,7 +718,9 @@ async function handleChatCompletion(req, res) {
       });
     }
 
-    if (stream) {
+    const responseContentType = response.headers.get('content-type') || '';
+
+    if (shouldStream || responseContentType.includes('text/event-stream')) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
@@ -746,8 +849,20 @@ async function handleChatCompletion(req, res) {
 
     } else {
       try {
-        const fullContent = await collectStreamContent(response);
-        
+        const rawResponse = await response.text();
+        let parsedResponse = null;
+
+        try {
+          parsedResponse = JSON.parse(rawResponse);
+        } catch (parseError) {
+          // 如果不是合法的JSON，则退回到构造OpenAI兼容格式
+        }
+
+        if (parsedResponse && typeof parsedResponse === 'object') {
+          res.json(parsedResponse);
+          return;
+        }
+
         const openaiResponse = {
           id: `chatcmpl-${Date.now()}`,
           object: 'chat.completion',
@@ -757,25 +872,25 @@ async function handleChatCompletion(req, res) {
             index: 0,
             message: {
               role: 'assistant',
-              content: fullContent
+              content: rawResponse
             },
             finish_reason: 'stop'
           }],
           usage: {
-            prompt_tokens: 0,
-            completion_tokens: fullContent.length,
-            total_tokens: fullContent.length
+            prompt_tokens: estimateTokenCount(JSON.stringify(messages)),
+            completion_tokens: estimateTokenCount(rawResponse),
+            total_tokens: estimateTokenCount(JSON.stringify(messages)) + estimateTokenCount(rawResponse)
           }
         };
 
         res.json(openaiResponse);
-      } catch (streamError) {
-        console.error('Error collecting stream content:', streamError);
+      } catch (nonStreamError) {
+        console.error('Error handling non-stream response:', nonStreamError);
         res.status(500).json({
           error: {
-            message: 'Error processing stream response',
-            type: 'server_error',
-            details: streamError.message
+            message: 'Failed to process API response',
+            type: 'api_error',
+            details: nonStreamError.message
           }
         });
       }
@@ -799,13 +914,20 @@ app.post('/v1/chat/completions', handleChatCompletion);
 // 登录和认证路由
 app.post('/api/auth/login', (req, res) => {
   const { username, password } = req.body;
-  
-  if (username === AUTH_CONFIG.username && password === AUTH_CONFIG.password) {
+
+  if (!username || !password) {
+    return res.status(400).json({
+      success: false,
+      message: '用户名和密码均为必填项'
+    });
+  }
+
+  if (verifyCredentials(username, password)) {
     req.session.authenticated = true;
     req.session.username = username;
     res.json({ success: true });
   } else {
-    res.status(401).json({ 
+    res.status(401).json({
       success: false, 
       message: '用户名或密码错误' 
     });
@@ -964,25 +1086,19 @@ app.get('/api/stats', async (req, res) => {
       ORDER BY date_key DESC
     `;
     
-    // 检查request_logs表是否存在client_ip列
-    const columnsQuery = `
-      SHOW COLUMNS FROM request_logs LIKE 'client_ip'
-    `;
-    
     // 并行执行基本查询
-    const [statsResult, columnsResult] = await Promise.all([
+    const [statsResult, hasClientIp] = await Promise.all([
       executeQuery(statsQuery, [Number(days)]),
-      executeQuery(columnsQuery)
+      hasClientIpColumn()
     ]);
-    
+
     const stats = statsResult[0];
-    const columns = columnsResult[0];
-    
+
     // 获取今日实时统计
     let todayStatsQuery;
-    if (columns.length > 0) {
+    if (hasClientIp) {
       todayStatsQuery = `
-        SELECT 
+        SELECT
           COUNT(*) as total_requests,
           COUNT(CASE WHEN response_status BETWEEN 200 AND 299 THEN 1 END) as successful_requests,
           COUNT(CASE WHEN response_status >= 400 THEN 1 END) as failed_requests,
@@ -999,11 +1115,11 @@ app.get('/api/stats', async (req, res) => {
           COUNT(CASE WHEN response_status >= 400 THEN 1 END) as failed_requests,
           AVG(response_time) as avg_response_time,
           0 as unique_ips
-        FROM request_logs 
+        FROM request_logs
         WHERE DATE(created_at) = CURDATE()
       `;
     }
-    
+
     // 获取错误统计
     const errorStatsQuery = `
       SELECT response_status, COUNT(*) as count
@@ -1015,12 +1131,12 @@ app.get('/api/stats', async (req, res) => {
     
     // 构建最活跃IP查询
     let topIpsQuery = null;
-    if (columns.length > 0) {
+    if (hasClientIp) {
       topIpsQuery = `
         SELECT client_ip, COUNT(*) as request_count
-        FROM request_logs 
+        FROM request_logs
         WHERE DATE(created_at) = CURDATE()
-        GROUP BY client_ip 
+        GROUP BY client_ip
         ORDER BY request_count DESC 
         LIMIT 10
       `;
